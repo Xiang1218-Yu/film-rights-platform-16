@@ -4,7 +4,8 @@ export type ApprovalStatus = 'pending' | 'approved' | 'rejected';
 
 export interface Project { id: string; code: string; title: string; season: number; status: ProjectStatus; currency: string; budgetVersionId: string; deliveryDate: string; }
 export interface BudgetLine { id: string; projectId: string; category: string; subcategory: string; planned: number; committed: number; actual: number; forecast: number; owner: string; risk: 'low' | 'medium' | 'high'; }
-export interface Contract { id: string; projectId: string; vendor: string; scope: string; ceiling: number; committed: number; paid: number; milestones: { name: string; due: string; amount: number; status: 'open' | 'invoiced' | 'paid' }[]; }
+export interface Milestone { name: string; due: string; amount: number; status: 'open' | 'invoiced' | 'paid'; paidAt?: string; }
+export interface Contract { id: string; projectId: string; vendor: string; scope: string; ceiling: number; committed: number; paid: number; milestones: Milestone[]; }
 export interface Asset { id: string; projectId: string; name: string; type: AssetType; version: number; status: 'draft' | 'review' | 'approved' | 'locked'; owner: string; checksum: string; territories: string[]; platforms: string[]; availableFrom: string; availableTo: string; rightsTags: string[]; }
 export interface Approval { id: string; projectId: string; entityType: 'budget' | 'asset' | 'delivery'; entityId: string; title: string; requestedBy: string; status: ApprovalStatus; approver: string; createdAt: string; comment?: string; }
 export interface AuditEvent { id: string; action: string; entity: string; entityId: string; actor: string; at: string; details: string; }
@@ -25,7 +26,7 @@ export const budgetLines: BudgetLine[] = [
 ];
 export const contracts: Contract[] = [
   { id: 'CTR-01', projectId: 'PRJ-001', vendor: '曜石后期制作', scope: '4K HDR 调色、声音、DCP 母版', ceiling: 5200000, committed: 4300000, paid: 2300000, milestones: [{ name: '锁剪交付', due: iso(8), amount: 1200000, status: 'invoiced' }, { name: '母版验收', due: iso(36), amount: 2000000, status: 'open' }] },
-  { id: 'CTR-02', projectId: 'PRJ-001', vendor: '远景国际版权', scope: '北美与欧洲音乐同步许可', ceiling: 880000, committed: 880000, paid: 440000, milestones: [{ name: '签署', due: iso(-16), amount: 440000, status: 'paid' }, { name: '交付版权证明', due: iso(4), amount: 440000, status: 'invoiced' }] },
+  { id: 'CTR-02', projectId: 'PRJ-001', vendor: '远景国际版权', scope: '北美与欧洲音乐同步许可', ceiling: 880000, committed: 880000, paid: 440000, milestones: [{ name: '签署', due: iso(-16), amount: 440000, status: 'paid', paidAt: iso(-10) }, { name: '交付版权证明', due: iso(4), amount: 440000, status: 'invoiced' }] },
   { id: 'CTR-03', projectId: 'PRJ-002', vendor: '云帧视觉', scope: '纪录片航拍与卫星素材', ceiling: 1600000, committed: 1100000, paid: 600000, milestones: [{ name: '素材包一', due: iso(20), amount: 500000, status: 'open' }] }
 ];
 export const assets: Asset[] = [
@@ -41,7 +42,73 @@ export const approvals: Approval[] = [
 ];
 export const auditEvents: AuditEvent[] = [{ id: 'AUD-01', action: 'CREATE', entity: 'budget', entityId: 'BUD-001-V3', actor: '制片主任', at: new Date(now - 86400000).toISOString(), details: '从 V2 复制并调整后期科目' }];
 
+export type MilestoneState = 'paid' | 'overdue' | 'approaching' | 'invoiced' | 'upcoming';
+export interface AssessedMilestone extends Milestone { state: MilestoneState; daysToDue: number; latePayment: boolean; lateDays: number; afterDelivery: boolean; flags: string[]; }
+export interface ContractHealth { contractId: string; vendor: string; scope: string; ceiling: number; committed: number; paid: number; counts: Record<MilestoneState, number>; exposure: number; overdueAmount: number; approachingAmount: number; invoicedAmount: number; inconsistencies: string[]; milestones: AssessedMilestone[]; }
+export interface PaymentRisk { kind: 'overdue' | 'approaching' | 'late-payment' | 'after-delivery' | 'inconsistency'; contractId: string; vendor: string; milestone?: string; amount: number; daysToDue?: number; detail: string; }
+
+export const APPROACHING_WINDOW_DAYS = 14;
+const DAY_MS = 86400000;
+const toDay = (date: string) => Date.parse(`${date}T00:00:00Z`);
+const todayIso = () => new Date().toISOString().slice(0, 10);
+const wan = (n: number) => `¥${(n / 10000).toFixed(0)}万`;
+
+export function assessMilestone(milestone: Milestone, deliveryDate: string, today = todayIso()): AssessedMilestone {
+  const daysToDue = Math.round((toDay(milestone.due) - toDay(today)) / DAY_MS);
+  const afterDelivery = milestone.due > deliveryDate;
+  const flags: string[] = [];
+  let state: MilestoneState;
+  let latePayment = false;
+  let lateDays = 0;
+  if (milestone.status === 'paid') {
+    state = 'paid';
+    if (milestone.paidAt && milestone.paidAt > milestone.due) { latePayment = true; lateDays = Math.round((toDay(milestone.paidAt) - toDay(milestone.due)) / DAY_MS); flags.push(`晚付 ${lateDays} 天`); }
+  } else if (daysToDue < 0) {
+    state = 'overdue'; flags.push(`逾期 ${-daysToDue} 天`); if (milestone.status === 'invoiced') flags.push('发票已开未付');
+  } else if (daysToDue <= APPROACHING_WINDOW_DAYS) {
+    state = 'approaching'; flags.push(daysToDue === 0 ? '今日到期' : `${daysToDue} 天后到期`);
+  } else if (milestone.status === 'invoiced') state = 'invoiced';
+  else state = 'upcoming';
+  if (afterDelivery) flags.push('晚于交付日');
+  return { ...milestone, state, daysToDue, latePayment, lateDays, afterDelivery, flags };
+}
+
+export function assessContract(contract: Contract, deliveryDate: string, today = todayIso()): ContractHealth {
+  const assessed = contract.milestones.map(milestone => assessMilestone(milestone, deliveryDate, today));
+  const counts: Record<MilestoneState, number> = { paid: 0, overdue: 0, approaching: 0, invoiced: 0, upcoming: 0 };
+  assessed.forEach(milestone => { counts[milestone.state] += 1; });
+  const sumBy = (state: MilestoneState) => assessed.filter(milestone => milestone.state === state).reduce((sum, milestone) => sum + milestone.amount, 0);
+  const inconsistencies: string[] = [];
+  const paidByMilestones = assessed.filter(milestone => milestone.status === 'paid').reduce((sum, milestone) => sum + milestone.amount, 0);
+  if (paidByMilestones !== contract.paid) inconsistencies.push(`合同已付 ${wan(contract.paid)} 与已支付节点合计 ${wan(paidByMilestones)} 不一致，可能存在未登记节点`);
+  const totalMilestones = assessed.reduce((sum, milestone) => sum + milestone.amount, 0);
+  if (totalMilestones > contract.committed) inconsistencies.push(`节点总额 ${wan(totalMilestones)} 超出合同承诺额 ${wan(contract.committed)}`);
+  if (contract.committed > contract.ceiling) inconsistencies.push(`承诺额 ${wan(contract.committed)} 超出合同额度上限 ${wan(contract.ceiling)}`);
+  assessed.filter(milestone => milestone.paidAt && milestone.status !== 'paid').forEach(milestone => inconsistencies.push(`节点「${milestone.name}」登记了支付日期但状态为 ${milestone.status}`));
+  return { contractId: contract.id, vendor: contract.vendor, scope: contract.scope, ceiling: contract.ceiling, committed: contract.committed, paid: contract.paid, counts, exposure: assessed.filter(milestone => milestone.status !== 'paid').reduce((sum, milestone) => sum + milestone.amount, 0), overdueAmount: sumBy('overdue'), approachingAmount: sumBy('approaching'), invoicedAmount: sumBy('invoiced'), inconsistencies, milestones: assessed };
+}
+
+export function paymentRisks(projectId = projects[0].id, today = todayIso()): PaymentRisk[] {
+  const project = projects.find(item => item.id === projectId);
+  if (!project) return [];
+  const risks: PaymentRisk[] = [];
+  contracts.filter(contract => contract.projectId === projectId).forEach(contract => {
+    const health = assessContract(contract, project.deliveryDate, today);
+    const share = (amount: number) => contract.committed > 0 ? `，占承诺额 ${Math.round(amount / contract.committed * 100)}%` : '';
+    health.milestones.forEach(milestone => {
+      if (milestone.state === 'overdue') risks.push({ kind: 'overdue', contractId: contract.id, vendor: contract.vendor, milestone: milestone.name, amount: milestone.amount, daysToDue: milestone.daysToDue, detail: `逾期 ${-milestone.daysToDue} 天${milestone.status === 'invoiced' ? '，发票已开未付' : '，尚未开票'}${share(milestone.amount)}` });
+      else if (milestone.state === 'approaching') risks.push({ kind: 'approaching', contractId: contract.id, vendor: contract.vendor, milestone: milestone.name, amount: milestone.amount, daysToDue: milestone.daysToDue, detail: `${milestone.daysToDue === 0 ? '今日到期' : `${milestone.daysToDue} 天后到期`}${share(milestone.amount)}` });
+      if (milestone.latePayment) risks.push({ kind: 'late-payment', contractId: contract.id, vendor: contract.vendor, milestone: milestone.name, amount: milestone.amount, detail: `已于 ${milestone.paidAt} 支付，晚于到期日 ${milestone.lateDays} 天` });
+      if (milestone.afterDelivery && milestone.state !== 'paid') risks.push({ kind: 'after-delivery', contractId: contract.id, vendor: contract.vendor, milestone: milestone.name, amount: milestone.amount, daysToDue: milestone.daysToDue, detail: `节点到期日 ${milestone.due} 晚于项目交付日 ${project.deliveryDate}` });
+    });
+    health.inconsistencies.forEach(text => risks.push({ kind: 'inconsistency', contractId: contract.id, vendor: contract.vendor, amount: 0, detail: text }));
+  });
+  const order: Record<PaymentRisk['kind'], number> = { overdue: 0, approaching: 1, 'late-payment': 2, 'after-delivery': 3, inconsistency: 4 };
+  return risks.sort((a, b) => order[a.kind] - order[b.kind] || b.amount - a.amount);
+}
+
 export function projectSummary(projectId = projects[0].id) {
+  const project = projects.find(item => item.id === projectId);
   const lines = budgetLines.filter(line => line.projectId === projectId);
   const projectContracts = contracts.filter(contract => contract.projectId === projectId);
   const projectAssets = assets.filter(asset => asset.projectId === projectId);
@@ -49,7 +116,7 @@ export function projectSummary(projectId = projects[0].id) {
   const planned = lines.reduce((sum, line) => sum + line.planned, 0);
   const forecast = lines.reduce((sum, line) => sum + line.forecast, 0);
   const actual = lines.reduce((sum, line) => sum + line.actual, 0);
-  return { project: projects.find(project => project.id === projectId), planned, forecast, actual, variance: forecast - planned, utilization: planned ? actual / planned : 0, committed: lines.reduce((sum, line) => sum + line.committed, 0), contractExposure: projectContracts.reduce((sum, contract) => sum + contract.ceiling, 0), assetCount: projectAssets.length, pendingApprovals: projectApprovals.filter(item => item.status === 'pending').length, highRiskLines: lines.filter(line => line.risk === 'high'), lines, contracts: projectContracts, assets: projectAssets, approvals: projectApprovals };
+  return { project, planned, forecast, actual, variance: forecast - planned, utilization: planned ? actual / planned : 0, committed: lines.reduce((sum, line) => sum + line.committed, 0), contractExposure: projectContracts.reduce((sum, contract) => sum + contract.ceiling, 0), assetCount: projectAssets.length, pendingApprovals: projectApprovals.filter(item => item.status === 'pending').length, highRiskLines: lines.filter(line => line.risk === 'high'), lines, contracts: projectContracts, contractHealth: projectContracts.map(contract => assessContract(contract, project?.deliveryDate ?? todayIso())), paymentRisks: paymentRisks(projectId), assets: projectAssets, approvals: projectApprovals };
 }
 
 export function rightsConflicts(projectId = projects[0].id) {
